@@ -1,6 +1,8 @@
 package singleflight
 
-import "sync"
+import (
+	"sync"
+)
 
 // call 代表正在进行中，或已经结束的请求。使用 sync.WaitGroup 锁避免重入。
 type call struct {
@@ -33,6 +35,7 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 	g.mu.Unlock()
 	c.val, c.err = fn()
 	c.wg.Done()
+	//time.Sleep(10 * time.Second)   //加上这个可以自己测试的时候更能体现防止缓存击穿
 	g.mu.Lock()
 	delete(g.m, key)
 	g.mu.Unlock()

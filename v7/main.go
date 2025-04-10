@@ -57,11 +57,18 @@ func main() {
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.Parse()
 
-	apiAddr := "http://localhost:9999"
+	//apiAddr := "http://localhost:9999"
+	//addrMap := map[int]string{
+	//	8001: "http://localhost:8001",
+	//	8002: "http://localhost:8002",
+	//	8003: "http://localhost:8003",
+	//}
+
+	apiAddr := "http://49.123.84.136:9999"
 	addrMap := map[int]string{
-		8001: "http://localhost:8001",
-		8002: "http://localhost:8002",
-		8003: "http://localhost:8003",
+		8001: "http://49.123.84.136:8001",
+		8002: "http://49.123.84.136:8002",
+		8003: "http://49.123.84.136:8003",
 	}
 
 	var addrs []string
