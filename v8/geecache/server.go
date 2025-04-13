@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	defaultAddr     = "127.0.0.1:6324"
+	defaultAddr     = "127.0.0.1:8081"
 	defaultReplicas = 50
 )
 
@@ -26,6 +26,9 @@ var (
 		Endpoints:   []string{"192.168.172.129:2379"},
 		DialTimeout: 5 * time.Second,
 	}
+
+	serviceLocker            sync.Mutex
+	serviceEndpointKeyPrefix = "geecache"
 )
 
 // server 和 Group 是解耦合的 所以server要自己实现并发控制
@@ -37,6 +40,9 @@ type Server struct {
 	mux        sync.Mutex
 	consHash   *consistenthash.Consistency
 	clients    map[string]*Client
+
+	ctx    context.Context //添加上下文信息可以用于 ，程序退出 监听的停止
+	cancel context.CancelFunc
 }
 
 // NewServer 创建cache的svr 若addr为空 则使用defaultAddr
@@ -48,7 +54,12 @@ func NewServer(addr string) (*Server, error) {
 	if !validPeerAddr(addr) {
 		return nil, fmt.Errorf("invalid addr %s, it should be x.x.x.x:port", addr)
 	}
-	return &Server{addr: addr}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Server{
+		addr:   addr,
+		ctx:    ctx,
+		cancel: cancel,
+	}, nil
 }
 
 // Get 实现PeanutCache service的Get接口
@@ -57,7 +68,7 @@ func (s *Server) Get(ctx context.Context, in *geecachepb.Request) (*geecachepb.R
 	groupName, key := in.GetGroup(), in.GetKey()
 	resp := &geecachepb.Response{}
 
-	log.Printf("[peanutcache_svr %s] Recv RPC Request - (%s)/(%s)", s.addr, groupName, key)
+	log.Printf("[geecache_svr %s] Recv RPC Request - (%s)/(%s)", s.addr, groupName, key)
 
 	if key == "" {
 		return resp, fmt.Errorf("key required")
@@ -94,7 +105,7 @@ func (s *Server) SetPeers(peersAddrs ...string) {
 			panic(fmt.Sprintf("[peer %s] invalid address format, it should be x.x.x.x:port", peerAddr))
 		}
 		service := fmt.Sprintf("geecache/%s", peerAddr)
-		s.clients[peerAddr] = NewClient(service)
+		s.clients[peerAddr] = NewClient(service, peerAddr)
 	}
 }
 
@@ -132,7 +143,7 @@ func (s *Server) Start() error {
 	s.status = true
 	s.stopSignal = make(chan error)
 	port := strings.Split(s.addr, ":")[1]
-	lis, err := net.Listen("tcp", port)
+	lis, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
@@ -158,10 +169,102 @@ func (s *Server) Start() error {
 	//log.Printf("[%s] register service ok\n", s.addr)
 	s.mux.Unlock()
 
+	// ✅ 然后再进行服务发现
+	// 等待片刻，确保注册成功（最保险）
+	time.Sleep(500 * time.Millisecond)
+	go ServiceDiscovery(s)
+
 	if err := grpcServer.Serve(lis); s.status && err != nil {
 		return fmt.Errorf("failed to serve: %v", err)
 	}
 	return nil
+}
+
+// ServiceDiscovery 服务发现
+func ServiceDiscovery(s *Server) {
+	cli, err := clientv3.New(defaultEtcdConfig)
+	if err != nil {
+		log.Printf("create etcd client failed: %v", err)
+		return
+	}
+
+	go func() {
+		//程序崩溃可以恢复过来
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ServiceDiscovery panic: %v", r)
+			}
+		}()
+
+		//ctx := context.Background()
+		serviceKey := fmt.Sprintf("%s/", serviceEndpointKeyPrefix)
+		// 获取当前所有服务入口
+		getRes, err := cli.Get(s.ctx, serviceKey, clientv3.WithPrefix())
+		if err != nil {
+			log.Printf("initial etcd get failed: %v", err)
+			return
+		}
+
+		//在main函数中注册了 哈希环，到开启发现etcd服务 之间可能有新的节点上线 进行处理
+		for _, v := range getRes.Kvs {
+			// 💡注册 client & 哈希环（避免重复）
+			serviceLocker.Lock()
+			if _, ok := s.clients[string(v.Value)]; !ok {
+				s.clients[string(v.Value)] = NewClient(string(v.Key), string(v.Value))
+				s.consHash.Register(string(v.Value))
+			}
+			serviceLocker.Unlock()
+		}
+
+		fmt.Printf("[service_endpoint_change] [%s] service %s get endpoints success\n", serviceEndpointKeyPrefix, serviceEndpointKeyPrefix)
+		ch := cli.Watch(s.ctx, serviceKey, clientv3.WithPrefix(), clientv3.WithPrevKV())
+		for {
+			select {
+			case <-s.ctx.Done():
+				log.Println("Service discovery exited due to context cancellation.")
+				return
+			case v, ok := <-ch:
+				if !ok {
+					log.Println("Watch channel closed, attempting to re-watch...")
+					time.Sleep(time.Second)
+					ch = cli.Watch(s.ctx, serviceKey, clientv3.WithPrefix(), clientv3.WithPrevKV())
+					continue
+				}
+				for _, v := range v.Events {
+					key := string(v.Kv.Key) //这里的key应该是前缀加addr:port
+					endpoint := string(v.Kv.Value)
+					switch v.Type {
+					// PUT，新增或替换   , todo 先考虑 新增节点的情况
+					case clientv3.EventTypePut:
+						//增加对应的客户端 增加对应的哈希环节点
+						serviceLocker.Lock()
+						if old := s.clients[endpoint]; old != nil {
+							// todo 可能只是元数据更新，不重复注册 client
+						} else {
+							s.clients[endpoint] = NewClient(key, endpoint)
+							s.consHash.Register(endpoint) //哈希环上要注册
+						}
+						serviceLocker.Unlock()
+
+						//todo  应该还要发生哈希环数据的迁移，确保一致性
+						// todo: 需要对临界资源哈希环进行更新，同时还要迁移哈希环上的数据，要确保数据的同步，如果迁移过程中又有新的访问，怎么进行同步呢访问
+					// DELETE
+					case clientv3.EventTypeDelete:
+						//删除节点
+						serviceLocker.Lock()
+						if _, ok := s.clients[endpoint]; ok {
+							delete(s.clients, endpoint)
+							s.consHash.Destroy(endpoint)
+						}
+						serviceLocker.Unlock()
+						////todo: 删除也需要更新hash 环，同时还要控制同步问题，删除过程中 一个请求过来了咋办？
+					}
+				}
+
+			}
+		}
+
+	}()
 }
 
 // Stop 停止server运行 如果server没有运行 这将是一个no-op
@@ -176,4 +279,25 @@ func (s *Server) Stop() {
 	s.clients = nil     // 清空一致性哈希信息 有助于垃圾回收
 	s.consHash = nil
 	s.mux.Unlock()
+}
+
+// 从etcd获取peer地址
+func (s *Server) GetPeersFromEtcd() ([]string, error) {
+	cli, err := clientv3.New(defaultEtcdConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create etcd client failed: %v", err)
+	}
+	defer cli.Close()
+
+	serviceKey := fmt.Sprintf("%s/", serviceEndpointKeyPrefix)
+	getRes, err := cli.Get(s.ctx, serviceKey, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("initial etcd get failed: %v", err)
+	}
+
+	var endpoints []string
+	for _, v := range getRes.Kvs {
+		endpoints = append(endpoints, string(v.Value))
+	}
+	return endpoints, nil
 }

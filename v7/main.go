@@ -33,6 +33,7 @@ func startCacheServer(addr string, addrs []string, gee *geecache.Group) {
 	log.Println("geecache is running at", addr)
 	log.Fatal(http.ListenAndServe(addr[7:], peers))
 }
+
 func startAPIServer(apiAddr string, gee *geecache.Group) {
 	http.Handle("/api", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		key := req.URL.Query().Get("key")
@@ -57,6 +58,7 @@ func main() {
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.Parse()
 
+	//这个是在本地
 	//apiAddr := "http://localhost:9999"
 	//addrMap := map[int]string{
 	//	8001: "http://localhost:8001",
@@ -64,6 +66,7 @@ func main() {
 	//	8003: "http://localhost:8003",
 	//}
 
+	//这个是在虚拟机环境下访问，模拟真是网络，所以ip地址是本机在以太网中的真实ip地址
 	apiAddr := "http://49.123.84.136:9999"
 	addrMap := map[int]string{
 		8001: "http://49.123.84.136:8001",

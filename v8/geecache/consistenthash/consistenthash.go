@@ -45,6 +45,21 @@ func (m *Consistency) Register(keys ...string) {
 	sort.Ints(m.ring)
 }
 
+// Destroy 将各个peer注销到哈希环上
+func (m *Consistency) Destroy(keys ...string) {
+	for _, key := range keys {
+		for i := 0; i < m.replicas; i++ { //分别求key对应的每个虚拟节点的，然后插入到哈希环上
+			hash := int(m.hash([]byte(strconv.Itoa(i) + key))) //求哈希值
+			index := sort.SearchInts(m.ring, hash)             //把虚拟机节点 存入到 哈希环的 m.keys上
+			if index < len(m.ring) && m.ring[index] == hash {
+				// 删除 hash
+				m.ring = append(m.ring[:index], m.ring[index+1:]...)
+				delete(m.hashMap, hash) //虚拟节点对应的节点key是多少
+			}
+		}
+	}
+}
+
 // Get gets the closest item in the hash to the provided key.
 // 选择节点的 Get() 方法，一个key打过来，来找到下一个节点，就是找到key应该存到哪个节点上
 func (m *Consistency) Get(key string) string {
